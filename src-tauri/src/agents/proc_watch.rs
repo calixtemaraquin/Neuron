@@ -28,15 +28,35 @@ fn runtime(name: &str) -> bool {
     RUNTIMES.contains(&base)
 }
 
+/// Arguments that make an agent binary one of its own helpers, not an agent at work: Codex runs each sandboxed
+/// command through `codex sandbox …` / `codex-linux-sandbox` (the `codex` executable under another name), and
+/// serves `app-server`, `exec-server`, `mcp-server`.
+const HELPER_ARGS: &[&str] = &["sandbox", "app-server", "exec-server", "mcp-server"];
+
 /// Agent key of a process: its program, or the script a runtime runs.
 fn agent_key(p: &ProcInfo) -> Option<&'static str> {
-    if let Some(key) = program_key(&p.name) {
-        return Some(key);
+    // A script's shebang (`#!/usr/bin/env node`) may still show as `env node script …`: skip `env` and its options.
+    let mut cmd = p.cmd.as_slice();
+    if cmd.first().is_some_and(|a| a.rsplit('/').next() == Some("env")) {
+        let skip = cmd.iter().skip(1).take_while(|a| a.starts_with('-') || a.contains('=')).count();
+        cmd = &cmd[1 + skip..];
     }
-    if runtime(&p.name) {
-        return p.cmd.iter().skip(1).find(|a| !a.starts_with('-')).and_then(|script| program_key(script));
+    // The name it was started as (argv[0]), else its executable: a binary started under another name
+    // (`codex-linux-sandbox`, a link to `codex`) is that other program.
+    let program = cmd.first().map(String::as_str).filter(|a| !a.is_empty()).unwrap_or(&p.name);
+    let rest = cmd.get(1..).unwrap_or_default();
+    let (key, args) = if runtime(program) || runtime(&p.name) {
+        let script = rest.iter().position(|a| !a.starts_with('-'))?;
+        (program_key(&rest[script])?, &rest[script + 1..])
+    } else {
+        // An executable by its own name only: the npm packages also ship helpers (`…/@openai/codex/…/codex-code-mode-host`).
+        let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+        (program_key(name)?, rest)
+    };
+    if args.iter().any(|a| HELPER_ARGS.contains(&a.as_str())) {
+        return None;
     }
-    None
+    Some(key)
 }
 
 /// Agent processes under `roots` (not the roots themselves), the highest of each chain only: the processes an
@@ -48,6 +68,11 @@ pub fn agents_under(procs: &[ProcInfo], roots: &[u32]) -> Vec<ProcAgent> {
             children.entry(parent).or_default().push(p);
         }
     }
+    // The chat's own agent: `node …/codex exec` starts the native `codex` binary, which is still that agent.
+    let root_keys: HashMap<u32, &str> = roots
+        .iter()
+        .filter_map(|root| procs.iter().find(|p| p.pid == *root).and_then(agent_key).map(|key| (*root, key)))
+        .collect();
     let mut found = Vec::new();
     let mut stack: Vec<u32> = roots.to_vec();
     let mut visited = std::collections::HashSet::new();
@@ -57,8 +82,10 @@ pub fn agents_under(procs: &[ProcInfo], roots: &[u32]) -> Vec<ProcAgent> {
         }
         for child in children.get(&pid).map(Vec::as_slice).unwrap_or_default() {
             match agent_key(child) {
-                Some(key) => found.push(ProcAgent { pid: child.pid, key, command: child.cmd.join(" ") }),
-                None => stack.push(child.pid),
+                Some(key) if root_keys.get(&pid) != Some(&key) => {
+                    found.push(ProcAgent { pid: child.pid, key, command: child.cmd.join(" ") })
+                }
+                _ => stack.push(child.pid),
             }
         }
     }
@@ -75,6 +102,9 @@ fn snapshot(system: &mut System) -> Vec<ProcInfo> {
     system
         .processes()
         .iter()
+        // Linux lists each thread as a child of its process (with the same command line): a Node agent's worker
+        // threads would each be taken for one more sub-agent.
+        .filter(|(_, p)| p.thread_kind().is_none())
         .map(|(pid, p)| ProcInfo {
             pid: pid.as_u32(),
             parent: p.parent().map(|parent| parent.as_u32()),
@@ -141,6 +171,34 @@ mod tests {
         let keys: Vec<(u32, &str)> = found.iter().map(|a| (a.pid, a.key)).collect();
         assert_eq!(keys, vec![(4, "antigravity"), (6, "gemini")]);
         assert!(agents_under(&procs, &[]).is_empty());
+    }
+
+    /// A Codex chat on Linux: npm wrapper → native binary → sandbox helpers and shells (seen with codex-cli 0.172).
+    #[test]
+    fn codex_own_processes_are_not_subagents() {
+        let vendor = "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/bin/codex";
+        let procs = vec![
+            p(1, 0, "node", "node /usr/local/bin/codex exec --json --sandbox workspace-write -- hi"),
+            p(2, 1, "codex", &format!("{vendor} exec --json")),
+            p(3, 2, "codex-linux-san", "/home/me/.codex/tmp/arg0/codex-linux-sandbox --sandbox-policy-cwd /repo"),
+            p(4, 3, "bwrap", "bwrap --as-pid-1 --die-with-parent"),
+            p(5, 4, "codex", "codex-linux-sandbox --sandbox-policy-cwd /repo"),
+            p(6, 5, "zsh", "/usr/bin/zsh -c sleep 4"),
+            p(7, 2, "node_repl", "/usr/lib/chatgpt/resources/cua_node/bin/node_repl"),
+            p(8, 7, "codex", "/usr/lib/chatgpt/resources/codex sandbox -c shell_environment_policy.inherit=all"),
+            p(11, 2, "codex-code-mode", "/usr/lib/node_modules/@openai/codex/vendor/bin/codex-code-mode-host"),
+            // A real sub-agent, started by one of Codex's shells.
+            p(9, 2, "zsh", "/usr/bin/zsh -lc codex exec 'review the diff'"),
+            p(10, 9, "node", "node /usr/local/bin/codex exec review the diff"),
+        ];
+        let keys: Vec<(u32, &str)> = agents_under(&procs, &[1]).iter().map(|a| (a.pid, a.key)).collect();
+        assert_eq!(keys, vec![(10, "codex")]);
+
+        // The wrapper first seen through its shebang (the command line is read once).
+        let mut procs = procs;
+        procs[0] = p(1, 0, "node", "/usr/bin/env node /usr/local/bin/codex exec --json -- hi");
+        let keys: Vec<(u32, &str)> = agents_under(&procs, &[1]).iter().map(|a| (a.pid, a.key)).collect();
+        assert_eq!(keys, vec![(10, "codex")]);
     }
 
     /// Real processes: `cargo test proc_watch -- --ignored` (a system tool copied as `gemini`, run for 3 s).
